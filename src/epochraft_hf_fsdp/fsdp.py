@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Type
 
 import torch
+from peft.tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
@@ -19,7 +20,11 @@ from torch.distributed.fsdp import CPUOffload, FullStateDictConfig  # type: igno
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType  # type: ignore
 from torch.distributed.fsdp.api import FullOptimStateDictConfig
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp.wrap import (
+    _or_policy,
+    lambda_auto_wrap_policy,
+    transformer_auto_wrap_policy,
+)
 
 
 def get_rank() -> int:
@@ -66,12 +71,37 @@ def get_transformer_block_class(
     return type(obj)
 
 
+def get_peft_wrap_policy(transformer_block_class: Type[nn.Module]):
+
+    def lambda_policy_fn(module):
+        if (
+            len(list(module.named_children())) == 0
+            and getattr(module, "weight", None) is not None
+            and module.weight.requires_grad
+        ):
+            return True
+        return False
+
+    lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
+    transformer_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=(
+            PrefixEncoder,
+            PromptEncoder,
+            PromptEmbedding,
+            transformer_block_class,
+        ),
+    )
+    return functools.partial(_or_policy, policies=[lambda_policy, transformer_wrap_policy])
+
+
 def setup_fsdp(
     model: nn.Module,
     sharding_strategy: ShardingStrategy,
     transformer_block_class: Type[nn.Module],
     cpu_offload: bool,
     low_cpu_init: bool,
+    use_peft: bool = False,
 ) -> FSDP:
     rank = get_rank()
     local_rank = get_local_rank()
@@ -84,9 +114,13 @@ def setup_fsdp(
         model,
         device_id=local_rank,
         sharding_strategy=sharding_strategy,
-        auto_wrap_policy=functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={transformer_block_class},
+        auto_wrap_policy=(
+            get_peft_wrap_policy(transformer_block_class)
+            if use_peft
+            else functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={transformer_block_class},
+            )
         ),
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,

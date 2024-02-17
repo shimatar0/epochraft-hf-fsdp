@@ -11,6 +11,8 @@ import torch
 import wandb
 from epochraft import CheckpointableDataset, CheckpointableIterator, Sample
 from epochraft_hf_fsdp import fsdp, lr_schedulers
+from epochraft_hf_fsdp.peft import PeftConfigFromFile, generate_peft_config
+from peft import get_peft_model
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
 from torch.distributed.fsdp import ShardingStrategy  # type: ignore
@@ -82,6 +84,7 @@ class Trainer:
         val_datasets: Sequence[tuple[str, CheckpointableDataset]],
         state: TrainerState,
         train_iter_state_dict: Optional[torch.Tensor] = None,
+        use_peft: bool = False,
     ) -> None:
         self.config = config
         self.model = model
@@ -93,6 +96,7 @@ class Trainer:
         self.val_datasets = val_datasets
         self.state = state
         self.train_iter_state_dict = train_iter_state_dict
+        self.use_peft = use_peft
 
         world_size = fsdp.get_world_size()
         assert config.global_batch_size % (config.micro_batch_size * world_size) == 0
@@ -104,6 +108,7 @@ class Trainer:
     def from_config(
         cls,
         config: TrainerConfig,
+        lora_config: Optional[PeftConfigFromFile],
         tokenizer: PreTrainedTokenizerBase,
         train_dataset: CheckpointableDataset,
         val_datasets: Sequence[tuple[str, CheckpointableDataset]],
@@ -163,12 +168,23 @@ class Trainer:
 
             model = BetterTransformer.transform(model)
 
+        if lora_config is not None:
+            peft_config = generate_peft_config(lora_config)
+            model = get_peft_model(model, peft_config)
+            trainable_params, all_param = model.get_nb_trainable_parameters()
+            logger.info(
+                f"PEFT model class: {type(model)},"
+                f"trainable params: {trainable_params:,d} || all params: {all_param:,d} "
+                f"|| trainable%: {100 * trainable_params / all_param}"
+            )
+
         model = fsdp.setup_fsdp(
             model,
             config.fsdp_sharding_strategy,
             layer_cls,
             cpu_offload=config.fsdp_cpu_offload,
             low_cpu_init=config.fsdp_low_cpu_init,
+            use_peft=lora_config is not None,
         )
         fsdp.apply_fsdp_checkpointing(model, layer_cls)
 
@@ -223,6 +239,7 @@ class Trainer:
             val_datasets=val_datasets,
             state=state,
             train_iter_state_dict=train_iter_state_dict,
+            use_peft=lora_config is not None,
         )
 
     def save_checkpoint(self, train_iter: CheckpointableIterator) -> None:
@@ -274,7 +291,11 @@ class Trainer:
                 }
 
                 # Checkpointing
-                if self.state.step % self.config.ckpt_steps == 0 and self.state.step > 0:
+                if (
+                    self.state.step % self.config.ckpt_steps == 0
+                    and self.state.step > 0
+                    and self.use_peft is False
+                ):
                     self.save_checkpoint(train_iter)
                     self.last_iter_completion_time = None  # Checkpointing breaks iteration times
 
@@ -304,7 +325,10 @@ class Trainer:
 
             self.train_iter_state_dict = train_iter.state_dict()
 
-        self.save_hf()
+        if self.use_peft is True:
+            self.save_peft_model()
+        else:
+            self.save_hf()
 
     def train_step(self, train_iter: CheckpointableIterator) -> LogDict:
         device = fsdp.get_local_rank()
@@ -404,3 +428,13 @@ class Trainer:
 
         torch.distributed.barrier()
         logger.info("Saved HF model")
+
+    def save_peft_model(self) -> None:
+        logger.info("Saving Peft model")
+        if fsdp.get_rank() == 0:
+            out_path = self.config.save_dir / "peft"
+            out_path.mkdir(parents=True, exist_ok=True)
+            self.model.save_pretrained(out_path)
+
+        torch.distributed.barrier()
+        logger.info("Saved Peft model")

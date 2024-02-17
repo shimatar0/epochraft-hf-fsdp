@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from epochraft_hf_fsdp import config as config_module
 from epochraft_hf_fsdp import fsdp, logging, pretraining_data
+from epochraft_hf_fsdp.peft import PeftConfigFromFile
 from epochraft_hf_fsdp.trainer import Trainer, TrainerConfig
 from transformers import AutoTokenizer
 
@@ -18,6 +19,8 @@ class Config:
     train_dataset: List[pretraining_data.DataSource]
     val_dataset: List[pretraining_data.DataSource]
     val_samples: int
+
+    peft: Optional[PeftConfigFromFile] = None
 
 
 def main() -> None:
@@ -45,7 +48,9 @@ def main() -> None:
         global_val_samples=config.val_samples,
     )
 
-    trainer = Trainer.from_config(config.trainer, tokenizer, train_dataset, val_datasets)
+    trainer = Trainer.from_config(
+        config.trainer, config.peft, tokenizer, train_dataset, val_datasets
+    )
     trainer.train()
 
 

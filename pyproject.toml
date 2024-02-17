@@ -37,6 +37,7 @@ dependencies = [
   "omegaconf",
   "wandb",
   "joblib",
+  "peft",
 ]
 dynamic = ["version"]
 
